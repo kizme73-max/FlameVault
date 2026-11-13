@@ -52,3 +52,12 @@ list virtualization for very large libraries.
 
 ## Licensing
 JUCE is AGPLv3 or commercial; the VST3 SDK is GPLv3 or Steinberg proprietary. Check this before distributing the plugin.
+
+## Build on GitHub (no local setup)
+Push this folder to a GitHub repo. `.github/workflows/build.yml` builds the VST3 on a Windows runner on every push.
+Download it from the repo's **Actions** tab > latest run > **Artifacts** > `FlameVault-win64`.
+Tag a commit `v0.1.0` (`git tag v0.1.0 && git push --tags`) to also publish the zips as a GitHub Release.
+
+## Troubleshooting
+The plugin writes a log to `%APPDATA%\FlameVault\log.txt` (type that into the Explorer address bar). After a crash or freeze,
+the last lines show where it happened. The Standalone build also writes a stack trace there if it crashes.

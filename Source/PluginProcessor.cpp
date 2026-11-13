@@ -1,9 +1,14 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Log.h"
+
+static void fvCrashHandler (void*) { FvLog ("CRASH\n" + juce::SystemStats::getStackBacktrace()); }
 
 FlameVaultProcessor::FlameVaultProcessor()
     : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
+    if (wrapperType == wrapperType_Standalone) juce::SystemStats::setApplicationCrashHandler (fvCrashHandler);
+    FvLog ("processor: created");
     formats.registerBasicFormats();
     diskThread.startThread();
     resampler = std::make_unique<juce::ResamplingAudioSource> (&transport, false, 2);
@@ -11,6 +16,7 @@ FlameVaultProcessor::FlameVaultProcessor()
 
 FlameVaultProcessor::~FlameVaultProcessor()
 {
+    FvLog ("processor: destroying");
     transport.stop();
     transport.setSource (nullptr);
     diskThread.stopThread (2000);
@@ -24,6 +30,7 @@ bool FlameVaultProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 
 void FlameVaultProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    FvLog ("processor: prepareToPlay " + juce::String (sampleRate) + " Hz, block " + juce::String (samplesPerBlock));
     transport.prepareToPlay (samplesPerBlock, sampleRate);
     resampler->prepareToPlay (samplesPerBlock, sampleRate);
 }

@@ -1,27 +1,33 @@
 #include "PluginEditor.h"
 #include "UIData.h"
+#include "Log.h"
 
 using Completion = juce::WebBrowserComponent::NativeFunctionCompletion;
 using Args = juce::Array<juce::var>;
 
+// Events must carry a non-void payload, otherwise the page cannot parse them.
+static juce::var pingVar() { auto* o = new juce::DynamicObject(); o->setProperty ("t", 1); return juce::var (o); }
+
 FlameVaultEditor::FlameVaultEditor (FlameVaultProcessor& p)
     : AudioProcessorEditor (&p), proc (p), web (makeOptions())
 {
+    FvLog ("editor: created");
     addAndMakeVisible (web);
 
-    proc.getLibrary().onChanged = [this] { web.emitEventIfBrowserIsVisible ("library", juce::var()); };
+    proc.getLibrary().onChanged = [this] { web.emitEventIfBrowserIsVisible ("library", pingVar()); };
     proc.getLibrary().onScan    = [this] (juce::var v) { web.emitEventIfBrowserIsVisible ("scan", v); };
 
     web.goToURL (juce::WebBrowserComponent::getResourceProviderRoot());
 
     setResizable (true, true);
-    setResizeLimits (900, 560, 3200, 1800);
-    setSize (1280, 800);
+    setResizeLimits (1100, 640, 3200, 1800);
+    setSize (1500, 900);
     startTimerHz (30);
 }
 
 FlameVaultEditor::~FlameVaultEditor()
 {
+    FvLog ("editor: destroying");
     stopTimer();
     proc.getLibrary().onChanged = nullptr;
     proc.getLibrary().onScan = nullptr;
@@ -80,14 +86,15 @@ juce::WebBrowserComponent::Options FlameVaultEditor::makeOptions()
     return Opt{}
         .withBackend (Opt::Backend::webview2)
         .withWinWebView2Options (Opt::WinWebView2{}
-            .withUserDataFolder (juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("FlameVaultWebView")))
+            .withUserDataFolder (juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("FlameVault").getChildFile ("WebView2_" + juce::File::getSpecialLocation (juce::File::currentExecutableFile).getFileNameWithoutExtension())))
         .withNativeIntegrationEnabled()
         .withResourceProvider ([this] (const juce::String& url) { return getResource (url); })
 
-        .withNativeFunction ("getLibrary", [this] (const Args&, Completion done) { done (proc.getLibrary().toVar()); })
+        .withNativeFunction ("getLibrary", [this] (const Args&, Completion done) { done (proc.getLibrary().libraryJson()); })
 
         .withNativeFunction ("addFolder", [this] (const Args&, Completion done)
         {
+            FvLog ("native: addFolder dialog");
             chooser = std::make_unique<juce::FileChooser> ("Choose a sample folder", juce::File(), "");
             chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
                                   [this] (const juce::FileChooser& fc)
@@ -98,12 +105,13 @@ juce::WebBrowserComponent::Options FlameVaultEditor::makeOptions()
             done (juce::var());
         })
 
-        .withNativeFunction ("rescan", [this] (const Args&, Completion done) { proc.getLibrary().rescan(); done (juce::var()); })
+        .withNativeFunction ("rescan", [this] (const Args&, Completion done) { FvLog ("native: rescan"); proc.getLibrary().rescan(); done (juce::var()); })
 
         .withNativeFunction ("play", [this] (const Args& a, Completion done)
         {
             const auto id = a[0].toString();
             const auto f = proc.getLibrary().fileFor (id);
+            FvLog ("native: play " + f.getFileName());
             done (f.existsAsFile() && proc.loadAndPlay (f, id));
         })
         .withNativeFunction ("pause",  [this] (const Args&, Completion done) { proc.pausePlayback(); done (juce::var()); })
@@ -114,7 +122,11 @@ juce::WebBrowserComponent::Options FlameVaultEditor::makeOptions()
         .withNativeFunction ("setRate",   [this] (const Args& a, Completion done) { proc.setRate ((double) a[0], (double) a[1]); done (juce::var()); })
 
         .withNativeFunction ("toggleFavorite", [this] (const Args& a, Completion done) { done (proc.getLibrary().toggleFavorite (a[0].toString())); })
-        .withNativeFunction ("getPeaks",       [this] (const Args& a, Completion done) { done (proc.getLibrary().peaksFor (a[0].toString())); })
+        .withNativeFunction ("getPeaks", [this] (const Args& a, Completion done)
+        {
+            juce::Component::SafePointer<FlameVaultEditor> safe (this);
+            proc.getLibrary().peaksAsync (a[0].toString(), [safe, done] (juce::var v) { if (safe != nullptr) done (v); });
+        })
 
         // Drag a sample out of the plugin window into the DAW (FL Studio playlist / Sampler / Edison ...).
         .withNativeFunction ("startDrag", [this] (const Args& a, Completion done)

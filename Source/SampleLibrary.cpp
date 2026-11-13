@@ -1,13 +1,19 @@
 #include "SampleLibrary.h"
+#include "Log.h"
 #include <map>
+#include <set>
 
 SampleLibrary::SampleLibrary() : juce::Thread ("FlameVault scanner")
 {
-    peakFormats.registerBasicFormats();
-    load();
+    startThread();                                   // run() loads library.json off the UI thread
 }
 
-SampleLibrary::~SampleLibrary() { stopThread (5000); }
+SampleLibrary::~SampleLibrary()
+{
+    signalThreadShouldExit();
+    pool.removeAllJobs (true, 3000);
+    stopThread (5000);
+}
 
 juce::File SampleLibrary::storeFile()
 {
@@ -34,41 +40,49 @@ juce::var SampleLibrary::recordToVar (const SampleRecord& r)
     o->setProperty ("conf", juce::roundToInt (r.score * 100.0f));
     o->setProperty ("fav", r.favorite);
     o->setProperty ("review", r.needsReview);
+    o->setProperty ("missing", r.missing);
     o->setProperty ("desc", r.description);
     return juce::var (o);
 }
 
-juce::var SampleLibrary::toVar()
+juce::String SampleLibrary::buildJson()
 {
     juce::Array<juce::var> list, f;
     {
         const juce::ScopedLock sl (lock);
-        for (auto& r : records)
-        {
-            auto v = recordToVar (r);
-            v.getDynamicObject()->setProperty ("missing", ! juce::File (r.path).existsAsFile());
-            list.add (v);
-        }
+        for (auto& r : records) list.add (recordToVar (r));
         for (auto& s : folders) f.add (s);
     }
     auto* o = new juce::DynamicObject();
     o->setProperty ("samples", list);
     o->setProperty ("folders", f);
-    return juce::var (o);
+    return juce::JSON::toString (juce::var (o), true);
+}
+
+void SampleLibrary::rebuildCache()
+{
+    auto json = buildJson();
+    const juce::ScopedLock sl (lock);
+    cacheJson = json;
+}
+
+juce::String SampleLibrary::libraryJson()
+{
+    const juce::ScopedLock sl (lock);
+    return cacheJson.isEmpty() ? juce::String ("{\"samples\":[],\"folders\":[]}") : cacheJson;
 }
 
 void SampleLibrary::addFolder (const juce::File& folder)
 {
     { const juce::ScopedLock sl (lock); folders.addIfNotAlreadyThere (folder.getFullPathName()); }
-    save();
+    persistAsync();
     rescan();
 }
 
 void SampleLibrary::rescan()
 {
-    signalThreadShouldExit();
-    stopThread (3000);
-    startThread();
+    doScan = true;
+    if (! isThreadRunning()) startThread();          // if a scan is running, it loops once more when it ends
 }
 
 bool SampleLibrary::toggleFavorite (const juce::String& id)
@@ -78,7 +92,7 @@ bool SampleLibrary::toggleFavorite (const juce::String& id)
         const juce::ScopedLock sl (lock);
         for (auto& r : records) if (r.id == id) { r.favorite = ! r.favorite; now = r.favorite; }
     }
-    save();
+    persistAsync();
     return now;
 }
 
@@ -89,7 +103,24 @@ juce::File SampleLibrary::fileFor (const juce::String& id)
     return {};
 }
 
-juce::var SampleLibrary::peaksFor (const juce::String& id)
+void SampleLibrary::persistAsync()
+{
+    juce::WeakReference<SampleLibrary> self (this);
+    pool.addJob ([self] { if (self != nullptr) { self->save(); self->rebuildCache(); } });
+}
+
+void SampleLibrary::peaksAsync (const juce::String& id, std::function<void (juce::var)> done)
+{
+    juce::WeakReference<SampleLibrary> self (this);
+    pool.addJob ([self, id, done]
+    {
+        if (self == nullptr) return;
+        auto v = self->computePeaks (id);
+        juce::MessageManager::callAsync ([self, v, done] { if (self != nullptr) done (v); });
+    });
+}
+
+juce::var SampleLibrary::computePeaks (const juce::String& id)
 {
     constexpr int N = 240;
     juce::File file;
@@ -108,8 +139,10 @@ juce::var SampleLibrary::peaksFor (const juce::String& id)
             }
     }
 
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
     std::vector<float> peaks ((size_t) N, 0.0f);
-    if (std::unique_ptr<juce::AudioFormatReader> reader { peakFormats.createReaderFor (file) })
+    if (std::unique_ptr<juce::AudioFormatReader> reader { fm.createReaderFor (file) })
     {
         const auto len = reader->lengthInSamples;
         const int ch = (int) juce::jmin (2u, reader->numChannels);
@@ -135,6 +168,25 @@ juce::var SampleLibrary::peaksFor (const juce::String& id)
 }
 
 void SampleLibrary::run()
+{
+    juce::WeakReference<SampleLibrary> self (this);
+    if (! loaded.load())
+    {
+        FvLog ("library: loading library.json");
+        load();
+        FvLog ("library: loaded " + juce::String ((int) records.size()) + " samples");
+        loaded = true;
+        rebuildCache();
+        juce::MessageManager::callAsync ([self] { if (self != nullptr && self->onChanged) self->onChanged(); });
+    }
+    while (! threadShouldExit() && doScan.exchange (false))
+    {
+        try { FvLog ("scan: start"); scanOnce(); FvLog ("scan: done"); }
+        catch (...) { FvLog ("scan: exception caught and ignored"); }
+    }
+}
+
+void SampleLibrary::scanOnce()
 {
     juce::AudioFormatManager fm;                  // scanner thread gets its own manager
     fm.registerBasicFormats();
@@ -168,14 +220,18 @@ void SampleLibrary::run()
     };
 
     std::vector<SampleRecord> out;
+    std::set<juce::String> seen;
     const int total = files.size();
     int done = 0;
+    juce::uint32 lastPost = 0;
+    FvLog ("scan: found " + juce::String (total) + " files");
     post (true, 0, total);
 
     for (auto& f : files)
     {
         if (threadShouldExit()) return;
 
+        try {
         SampleRecord r;
         const auto id = juce::String::toHexString (f.getFullPathName().hashCode64());
         auto it = old.find (id);
@@ -209,17 +265,26 @@ void SampleLibrary::run()
                 r.durationSec = rd->sampleRate > 0 ? (double) rd->lengthInSamples / rd->sampleRate : 0.0;
             }
         }
+        r.missing = false;
         if (it != old.end()) r.favorite = it->second.favorite;
+        seen.insert (id);
         out.push_back (std::move (r));
+        } catch (...) { FvLog ("scan: skipped a file that threw: " + f.getFileName()); }
 
-        if (++done % 25 == 0) post (true, done, total);
+        ++done;
+        const auto now = juce::Time::getMillisecondCounter();
+        if (now - lastPost > 150) { lastPost = now; post (true, done, total); }
     }
+
+    for (auto& kv : old)                              // known samples whose file vanished stay listed as Missing
+        if (seen.find (kv.first) == seen.end()) { auto r = kv.second; r.missing = true; out.push_back (std::move (r)); }
 
     {
         const juce::ScopedLock sl (lock);
         records = std::move (out);
     }
     save();
+    rebuildCache();
     post (false, total, total);
     juce::MessageManager::callAsync ([self] { if (self != nullptr && self->onChanged) self->onChanged(); });
 }
@@ -248,9 +313,10 @@ void SampleLibrary::save()
     root->setProperty ("samples", list);
     root->setProperty ("folders", f);
 
+    const juce::ScopedLock sl (saveLock);
     const auto file = storeFile();
     file.getParentDirectory().createDirectory();
-    file.replaceWithText (juce::JSON::toString (juce::var (root)));
+    file.replaceWithText (juce::JSON::toString (juce::var (root), true));
 }
 
 void SampleLibrary::load()
@@ -258,8 +324,10 @@ void SampleLibrary::load()
     const auto v = juce::JSON::parse (storeFile());
     if (! v.isObject()) return;
 
+    std::vector<SampleRecord> loadedRecords;
+    juce::StringArray loadedFolders;
     if (auto* fa = v["folders"].getArray())
-        for (auto& s : *fa) folders.add (s.toString());
+        for (auto& s : *fa) loadedFolders.add (s.toString());
     if (auto* arr = v["samples"].getArray())
         for (auto& s : *arr)
         {
@@ -268,8 +336,12 @@ void SampleLibrary::load()
             r.category = s["cat"].toString(); r.subcategory = s["sub"].toString(); r.form = s["form"].toString();
             r.genres = s["genres"].toString(); r.key = s["key"].toString(); r.description = s["desc"].toString();
             r.bpm = (int) s["bpm"]; r.durationSec = (double) s["dur"]; r.score = (float) (double) s["score"];
-            r.favorite = (bool) s["fav"]; r.needsReview = (bool) s["review"];
+            r.favorite = (bool) s["fav"]; r.needsReview = (bool) s["review"]; r.missing = (bool) s["missing"];
             r.channels = (int) s["ch"]; r.sampleRate = (double) s["sr"];
-            records.push_back (std::move (r));
+            loadedRecords.push_back (std::move (r));
         }
+
+    const juce::ScopedLock sl (lock);
+    records = std::move (loadedRecords);
+    folders = loadedFolders;
 }

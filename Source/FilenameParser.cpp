@@ -73,7 +73,7 @@ Evidence ev (const std::string& tok, const Rule& r)
 }
 }
 
-ParseResult parseFilename (const juce::String& fileName)
+static ParseResult parseImpl (const juce::String& fileName)
 {
     ParseResult res;
     res.version = "1.0.0";
@@ -153,5 +153,11 @@ ParseResult parseFilename (const juce::String& fileName)
     for (auto& e : res.evidence) if (e.field == "Tag") res.tags.addIfNotAlreadyThere (e.value);
     res.assignedCategory = res.strength == Strength::High ? res.suggestedCategory : "Uncategorized";
     return res;
+}
+
+ParseResult parseFilename (const juce::String& fileName)
+{
+    try { return parseImpl (fileName); }
+    catch (...) { ParseResult r; r.version = "1.0.0"; r.suggestedCategory = r.assignedCategory = "Uncategorized"; return r; }
 }
 }
